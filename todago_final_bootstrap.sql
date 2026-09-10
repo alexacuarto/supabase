@@ -88,6 +88,7 @@ create table if not exists public.passengers (
   profile_id uuid not null unique references public.profiles(id) on delete cascade,
   default_address text,
   account_passenger_type text not null default 'Regular',
+  selfie_photo_url text,
   discount_document_url text,
   discount_document_status text not null default 'NOT_REQUIRED',
   discount_document_type text,
@@ -1119,14 +1120,38 @@ create or replace function public.admin_restrict_passenger(
 returns void
 language plpgsql
 security definer
+set search_path = public
 as $$
+declare
+  v_passenger_id uuid;
+  v_profile_id uuid;
 begin
-  update public.passengers
-  set booking_restriction_until = now() + (coalesce(p_days, 31) || ' days')::interval,
-      cancel_count = greatest(coalesce(cancel_count, 0), 3),
-      warning_status = true,
-      updated_at = now()
-  where id = p_passenger_id;
+  if not public.is_admin() then raise exception 'Administrator access required.'; end if;
+  if p_days is null or p_days < 1 or p_days > 365 then raise exception 'Invalid restriction duration.'; end if;
+
+  select id, profile_id into v_passenger_id, v_profile_id
+  from public.passengers
+  where id = p_passenger_id or profile_id = p_passenger_id
+  limit 1;
+
+  if v_passenger_id is null then
+    if exists (select 1 from public.profiles where id = p_passenger_id and role = 'passenger') then
+      insert into public.passengers (id, profile_id, booking_restriction_until, updated_at)
+      values (gen_random_uuid(), p_passenger_id, now() + make_interval(days => p_days), now())
+      returning id, profile_id into v_passenger_id, v_profile_id;
+    else
+      raise exception 'Passenger not found.';
+    end if;
+  else
+    update public.passengers
+    set booking_restriction_until = now() + make_interval(days => p_days),
+        updated_at = now()
+    where id = v_passenger_id;
+  end if;
+
+  if v_profile_id is not null then
+    update public.profiles set updated_at = now() where id = v_profile_id;
+  end if;
 end;
 $$;
 
@@ -1136,26 +1161,32 @@ create or replace function public.admin_lift_passenger_restriction(
 returns void
 language plpgsql
 security definer
+set search_path = public
 as $$
 declare
+  v_passenger_id uuid;
   v_profile_id uuid;
 begin
-  select profile_id into v_profile_id
+  if not public.is_admin() then raise exception 'Administrator access required.'; end if;
+
+  select id, profile_id into v_passenger_id, v_profile_id
   from public.passengers
-  where id = p_passenger_id;
+  where id = p_passenger_id or profile_id = p_passenger_id
+  limit 1;
 
-  update public.passengers
-  set booking_restriction_until = null,
-      cancel_count = 0,
-      warning_status = false,
-      updated_at = now()
-  where id = p_passenger_id;
-
-  if v_profile_id is not null then
-    update public.profiles
-    set is_active = true
-    where id = v_profile_id;
+  if v_passenger_id is not null then
+    update public.passengers
+    set booking_restriction_until = null,
+        cancel_count = 0,
+        warning_status = false,
+        updated_at = now()
+    where id = v_passenger_id;
   end if;
+
+  update public.profiles
+  set is_active = true,
+      updated_at = now()
+  where id = coalesce(v_profile_id, p_passenger_id);
 end;
 $$;
 
@@ -1506,19 +1537,33 @@ begin
     return json_build_object('success', false, 'error', 'Round trip cannot be completed before arriving at the return location.');
   end if;
 
-  update public.bookings
-  set status = 'completed',
-      trip_phase = 'completed',
-      actual_fare = coalesce(actual_fare, estimated_fare),
-      completed_at = now(),
-      updated_at = now()
-  where id = p_booking_id;
+  -- Determine final settled fare (final_fare takes highest precedence, then actual_fare, then regular_fare if rejected, then estimated_fare)
+  declare
+    v_final_fare numeric;
+  begin
+    v_final_fare := coalesce(
+      v_booking.final_fare,
+      v_booking.actual_fare,
+      case when v_booking.discount_review_status = 'REJECTED' or v_booking.discount_verified = false then v_booking.regular_fare else null end,
+      v_booking.estimated_fare,
+      0
+    );
 
-  update public.drivers
-  set last_completed_ride_at = now()
-  where id = v_driver_id;
+    update public.bookings
+    set status = 'completed',
+        trip_phase = 'completed',
+        final_fare = v_final_fare,
+        actual_fare = v_final_fare,
+        completed_at = now(),
+        updated_at = now()
+    where id = p_booking_id;
 
-  return json_build_object('success', true, 'booking_id', p_booking_id, 'status', 'completed', 'fare', coalesce(v_booking.actual_fare, v_booking.estimated_fare));
+    update public.drivers
+    set last_completed_ride_at = now()
+    where id = v_driver_id;
+
+    return json_build_object('success', true, 'booking_id', p_booking_id, 'status', 'completed', 'fare', v_final_fare);
+  end;
 end;
 $$;
 
@@ -2212,15 +2257,39 @@ begin
                     + coalesce((v_booking.passenger_qty ->> 'Senior Citizen')::int, 0);
   v_total_count := greatest(1, v_regular_count + v_student_count + v_pwd_count + v_senior_count);
 
+  -- Fetch total stops count (minimum 1)
+  v_stops_count := greatest(
+    1,
+    coalesce(
+      v_booking.total_stops,
+      case
+        when v_booking.stops is not null and jsonb_typeof(to_jsonb(v_booking.stops)) = 'array'
+        then jsonb_array_length(to_jsonb(v_booking.stops))
+        else 1
+      end
+    )
+  );
+
+  -- Select proper fare configuration based on trip_type (Special Trip maps to round_trip)
   select *
   into v_fare_config
   from public.fare_configurations
   where trip_type = case
-    when lower(coalesce(v_booking.trip_type, 'one_way')) like '%round%' then 'round_trip'
+    when lower(coalesce(v_booking.trip_type, 'one_way')) like '%round%'
+      or lower(coalesce(v_booking.trip_type, 'one_way')) like '%special%' then 'round_trip'
     else 'one_way'
   end
     and is_active = true
   limit 1;
+
+  if v_fare_config is null then
+    select *
+    into v_fare_config
+    from public.fare_configurations
+    where is_active = true
+    order by (case when trip_type = 'one_way' then 1 else 2 end)
+    limit 1;
+  end if;
 
   if v_fare_config is null then
     v_final_fare := coalesce(v_booking.final_fare, v_booking.estimated_fare, 0);
@@ -2232,36 +2301,41 @@ begin
     return json_build_object('success', true, 'final_fare', v_final_fare);
   end if;
 
+  -- Count discount requests:
+  -- Eligible discounts include APPROVED and PENDING (provisional). REJECTED discounts are NOT eligible.
   select
     count(*)::int,
     count(*) filter (where status = 'PENDING')::int,
     count(*) filter (where status = 'REJECTED')::int,
-    count(*) filter (where status = 'APPROVED' and discount_type = 'Student')::int,
-    count(*) filter (where status = 'APPROVED' and discount_type = 'PWD')::int,
-    count(*) filter (where status = 'APPROVED' and discount_type = 'Senior Citizen')::int
-  into v_request_count, v_pending_count, v_rejected_count, v_approved_student, v_approved_pwd, v_approved_senior
+    count(*) filter (where status = 'APPROVED')::int,
+    count(*) filter (where status in ('APPROVED', 'PENDING') and lower(discount_type) like '%student%')::int,
+    count(*) filter (where status in ('APPROVED', 'PENDING') and lower(discount_type) like '%pwd%')::int,
+    count(*) filter (where status in ('APPROVED', 'PENDING') and (lower(discount_type) like '%senior%' or lower(discount_type) like '%citizen%'))::int
+  into v_request_count, v_pending_count, v_rejected_count, v_approved_count, v_eligible_student, v_eligible_pwd, v_eligible_senior
   from public.booking_discount_requests
   where booking_id = p_booking_id;
 
-  v_approved_student := least(v_student_count, coalesce(v_approved_student, 0));
-  v_approved_pwd := least(v_pwd_count, coalesce(v_approved_pwd, 0));
-  v_approved_senior := least(v_senior_count, coalesce(v_approved_senior, 0));
+  v_eligible_student := least(v_student_count, coalesce(v_eligible_student, 0));
+  v_eligible_pwd := least(v_pwd_count, coalesce(v_eligible_pwd, 0));
+  v_eligible_senior := least(v_senior_count, coalesce(v_eligible_senior, 0));
 
-  v_additional_km := greatest(0, coalesce(v_booking.estimated_distance_km, 0) - v_fare_config.included_km);
+  -- Distance & fare calculation incorporating stops
+  v_additional_km := greatest(0, coalesce(v_booking.estimated_distance_km, 0) - (v_fare_config.included_km * v_stops_count));
   v_charged_additional_km := ceil(v_additional_km)::int;
-  v_base_per_passenger := v_fare_config.base_fare;
+  v_base_per_passenger := v_fare_config.base_fare * v_stops_count;
   v_per_passenger_subtotal := v_base_per_passenger + (v_charged_additional_km * v_fare_config.succeeding_km_fare);
   v_regular_fare := v_per_passenger_subtotal * v_total_count;
 
+  -- Dynamic final fare: subtract only currently eligible discounts
   v_final_fare := v_regular_fare
-    - (v_per_passenger_subtotal * (v_fare_config.student_discount / 100) * v_approved_student)
-    - (v_per_passenger_subtotal * (v_fare_config.pwd_discount / 100) * v_approved_pwd)
-    - (v_per_passenger_subtotal * (v_fare_config.senior_citizen_discount / 100) * v_approved_senior);
+    - (v_per_passenger_subtotal * (v_fare_config.student_discount / 100) * v_eligible_student)
+    - (v_per_passenger_subtotal * (v_fare_config.pwd_discount / 100) * v_eligible_pwd)
+    - (v_per_passenger_subtotal * (v_fare_config.senior_citizen_discount / 100) * v_eligible_senior);
   v_final_fare := greatest(0, round(v_final_fare, 2));
 
   if v_request_count = 0 then
     v_status := 'NOT_REQUIRED';
-  elsif v_pending_count > 0 and (v_rejected_count > 0 or (v_approved_student + v_approved_pwd + v_approved_senior) > 0) then
+  elsif v_pending_count > 0 and (v_rejected_count > 0 or v_approved_count > 0) then
     v_status := 'PARTIALLY_APPROVED';
   elsif v_pending_count > 0 then
     v_status := 'PENDING_DRIVER_REVIEW';
@@ -2273,12 +2347,27 @@ begin
     v_status := 'APPROVED';
   end if;
 
+  -- Ensure that when all discounts are rejected, final_fare equals regular_fare exactly
+  if v_status = 'REJECTED' then
+    v_final_fare := v_regular_fare;
+  end if;
+
   update public.bookings
   set regular_fare = coalesce(regular_fare, v_regular_fare),
       provisional_discounted_fare = coalesce(provisional_discounted_fare, estimated_fare),
       final_fare = v_final_fare,
-      actual_fare = case when status in ('droppedOff', 'paymentSent', 'completed') then v_final_fare else actual_fare end,
+      actual_fare = v_final_fare,
+      estimated_fare = case when v_status = 'REJECTED' then v_final_fare else estimated_fare end,
       discount_review_status = v_status,
+      discount_verified = case
+        when v_status = 'APPROVED' then true
+        when v_status = 'REJECTED' then false
+        else discount_verified
+      end,
+      passenger_type_display = case
+        when v_status = 'REJECTED' then 'Regular'
+        else passenger_type_display
+      end,
       discount_reviewed_at = now(),
       updated_at = now()
   where id = p_booking_id;
@@ -2287,7 +2376,9 @@ begin
     'success', true,
     'booking_id', p_booking_id,
     'discount_review_status', v_status,
-    'final_fare', v_final_fare
+    'final_fare', v_final_fare,
+    'actual_fare', v_final_fare,
+    'regular_fare', v_regular_fare
   );
 end;
 $$;
@@ -2401,6 +2492,105 @@ begin
     v_last := public.recalculate_booking_discount_summary(p_booking_id);
   end if;
   return v_last;
+end;
+$$;
+
+create or replace function public.reject_booking_discount_and_revert_fare(
+  p_booking_id uuid,
+  p_reason text default 'Physical ID not accepted'
+)
+returns json
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_booking public.bookings%rowtype;
+  v_regular_fare numeric(10,2);
+  v_driver_id uuid;
+  v_passenger_profile_id uuid;
+  v_summary json;
+begin
+  select id into v_driver_id
+  from public.drivers
+  where profile_id = auth.uid()
+  limit 1;
+
+  if v_driver_id is null and not public.is_admin() then
+    raise exception 'Only assigned drivers or admins can reject discount.';
+  end if;
+
+  select * into v_booking
+  from public.bookings
+  where id = p_booking_id
+  for update;
+
+  if not found then
+    raise exception 'Booking not found.';
+  end if;
+
+  v_regular_fare := coalesce(v_booking.regular_fare, v_booking.estimated_fare);
+
+  -- Mark all pending companion requests for this booking as REJECTED
+  update public.booking_discount_requests
+  set status = 'REJECTED',
+      rejection_reason = p_reason,
+      reviewed_by_driver_id = v_driver_id,
+      reviewed_at = now(),
+      updated_at = now()
+  where booking_id = p_booking_id
+    and status = 'PENDING';
+
+  -- Recalculate summary to guarantee math consistency
+  v_summary := public.recalculate_booking_discount_summary(p_booking_id);
+
+  -- Ensure direct booking columns are fully updated
+  update public.bookings
+  set discount_verified = false,
+      discount_rejected_reason = p_reason,
+      passenger_type_display = 'Regular',
+      discount_review_status = 'REJECTED',
+      final_fare = coalesce((v_summary->>'final_fare')::numeric, v_regular_fare),
+      actual_fare = coalesce((v_summary->>'final_fare')::numeric, v_regular_fare),
+      estimated_fare = coalesce((v_summary->>'final_fare')::numeric, v_regular_fare),
+      discount_reviewed_at = now(),
+      updated_at = now()
+  where id = p_booking_id;
+
+  -- Notify passenger of regular fare reversion
+  select profile_id into v_passenger_profile_id
+  from public.passengers
+  where id = v_booking.passenger_id;
+
+  if v_passenger_profile_id is not null then
+    insert into public.notifications (
+      recipient_id, type, title, body, notification_category, data, is_read, is_sent
+    )
+    values (
+      v_passenger_profile_id,
+      'in_app',
+      'Discount Not Accepted - Fare Reverted',
+      format('Your driver could not accept the discount ID. The fare has reverted to the regular price of ₱%s.', coalesce(v_regular_fare, 0)),
+      'discount_rejected',
+      jsonb_build_object(
+        'booking_id', p_booking_id,
+        'status', 'REJECTED',
+        'reason', p_reason,
+        'fare', v_regular_fare
+      ),
+      false,
+      true
+    );
+  end if;
+
+  return json_build_object(
+    'success', true,
+    'booking_id', p_booking_id,
+    'fare', v_regular_fare,
+    'regular_fare', v_regular_fare,
+    'final_fare', v_regular_fare,
+    'actual_fare', v_regular_fare
+  );
 end;
 $$;
 
@@ -2650,29 +2840,71 @@ $$;
 create or replace function public.admin_restrict_passenger(p_passenger_id uuid, p_days int default 31)
 returns void language plpgsql security definer set search_path = public
 as $$
+declare
+  v_passenger_id uuid;
+  v_profile_id uuid;
 begin
   if not public.is_admin() then raise exception 'Administrator access required.'; end if;
   if p_days is null or p_days < 1 or p_days > 365 then raise exception 'Invalid restriction duration.'; end if;
-  update public.passengers
-  set booking_restriction_until = now() + make_interval(days => p_days), updated_at = now()
-  where id = p_passenger_id;
-  if not found then raise exception 'Passenger not found.'; end if;
+
+  select id, profile_id into v_passenger_id, v_profile_id
+  from public.passengers
+  where id = p_passenger_id or profile_id = p_passenger_id
+  limit 1;
+
+  if v_passenger_id is null then
+    if exists (select 1 from public.profiles where id = p_passenger_id and role = 'passenger') then
+      insert into public.passengers (id, profile_id, booking_restriction_until, updated_at)
+      values (gen_random_uuid(), p_passenger_id, now() + make_interval(days => p_days), now())
+      returning id, profile_id into v_passenger_id, v_profile_id;
+    else
+      raise exception 'Passenger not found.';
+    end if;
+  else
+    update public.passengers
+    set booking_restriction_until = now() + make_interval(days => p_days),
+        updated_at = now()
+    where id = v_passenger_id;
+  end if;
+
+  if v_profile_id is not null then
+    update public.profiles set updated_at = now() where id = v_profile_id;
+  end if;
 end;
 $$;
 
 create or replace function public.admin_lift_passenger_restriction(p_passenger_id uuid)
 returns void language plpgsql security definer set search_path = public
 as $$
+declare
+  v_passenger_id uuid;
+  v_profile_id uuid;
 begin
   if not public.is_admin() then raise exception 'Administrator access required.'; end if;
-  update public.passengers
-  set booking_restriction_until = null, updated_at = now()
-  where id = p_passenger_id;
-  if not found then raise exception 'Passenger not found.'; end if;
+
+  select id, profile_id into v_passenger_id, v_profile_id
+  from public.passengers
+  where id = p_passenger_id or profile_id = p_passenger_id
+  limit 1;
+
+  if v_passenger_id is not null then
+    update public.passengers
+    set booking_restriction_until = null,
+        cancel_count = 0,
+        warning_status = false,
+        updated_at = now()
+    where id = v_passenger_id;
+  end if;
+
+  -- Guarantee the profile is active so booking checks and triggers succeed
+  update public.profiles
+  set is_active = true,
+      updated_at = now()
+  where id = coalesce(v_profile_id, p_passenger_id);
 end;
 $$;
 
--- A cancellation by another party must not recreate a restriction lifted by an admin.
+-- Passenger cancellation statistics (admin solely controls booking restrictions)
 create or replace function public.recalculate_passenger_cancellation_stats(
   p_passenger_id uuid
 )
@@ -2694,6 +2926,7 @@ begin
      and pg_trigger_depth() = 0 then
     raise exception 'Not authorized to recalculate this passenger.';
   end if;
+
   select cancel_count, booking_restriction_until into v_previous_count, v_restriction_until
   from public.passengers where id = p_passenger_id for update;
 
@@ -2713,16 +2946,15 @@ begin
   from public.bookings
   where passenger_id = p_passenger_id;
 
-  if v_policy_cancelled >= 3 and v_policy_cancelled > coalesce(v_previous_count, 0) then
-    v_restriction_until := greatest(v_restriction_until, now() + interval '31 days');
-  elsif v_restriction_until <= now() then
+  -- Only expire past restrictions; do not automatically impose restrictions
+  if v_restriction_until is not null and v_restriction_until <= now() then
     v_restriction_until := null;
   end if;
 
   update public.passengers
   set cancel_count = coalesce(v_policy_cancelled, 0),
       last_cancel_date = v_last_passenger_cancel,
-      warning_status = coalesce(v_policy_cancelled, 0) = 2,
+      warning_status = coalesce(v_policy_cancelled, 0) >= 2,
       booking_restriction_until = v_restriction_until,
       updated_at = now()
   where id = p_passenger_id;
