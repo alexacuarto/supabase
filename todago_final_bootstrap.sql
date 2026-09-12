@@ -90,6 +90,7 @@ create table if not exists public.passengers (
   account_passenger_type text not null default 'Regular',
   selfie_photo_url text,
   discount_document_url text,
+  discount_document_back_url text,
   discount_document_status text not null default 'NOT_REQUIRED',
   discount_document_type text,
   discount_document_rejection_reason text,
@@ -2214,29 +2215,32 @@ security definer
 set search_path = public
 as $$
 declare
-  v_booking record;
-  v_passenger record;
-  v_fare_config record;
-  v_regular_count int;
-  v_student_count int;
-  v_pwd_count int;
-  v_senior_count int;
-  v_total_count int;
-  v_approved_student int := 0;
-  v_approved_pwd int := 0;
-  v_approved_senior int := 0;
+  v_booking public.bookings%rowtype;
+  v_passenger public.passengers%rowtype;
+  v_fare_config public.fare_configurations%rowtype;
+  v_regular_count int := 0;
+  v_student_count int := 0;
+  v_pwd_count int := 0;
+  v_senior_count int := 0;
+  v_total_count int := 1;
+  v_stops_count int := 1;
+  v_additional_km numeric := 0;
+  v_charged_additional_km int := 0;
+  v_base_per_passenger numeric := 0;
+  v_per_passenger_subtotal numeric := 0;
+  v_regular_fare numeric := 0;
+  v_final_fare numeric := 0;
+  v_request_count int := 0;
   v_pending_count int := 0;
   v_rejected_count int := 0;
-  v_request_count int := 0;
-  v_base_per_passenger numeric;
-  v_regular_fare numeric;
-  v_final_fare numeric;
-  v_additional_km numeric;
-  v_charged_additional_km int;
-  v_per_passenger_subtotal numeric;
-  v_status text;
+  v_approved_count int := 0;
+  v_eligible_student int := 0;
+  v_eligible_pwd int := 0;
+  v_eligible_senior int := 0;
+  v_status text := 'NOT_REQUIRED';
 begin
-  select * into v_booking
+  select *
+  into v_booking
   from public.bookings
   where id = p_booking_id
   for update;
@@ -2270,13 +2274,18 @@ begin
     )
   );
 
-  -- Select proper fare configuration based on trip_type (Special Trip maps to round_trip)
+  -- Select proper fare configuration based on trip_type:
+  -- 'Service', 'Round trip', 'round_trip', 'Special Trip', or any booking with multiple stops (> 1)
+  -- strictly maps to 'round_trip' configuration. One-way trips map to 'one_way'.
   select *
   into v_fare_config
   from public.fare_configurations
   where trip_type = case
-    when lower(coalesce(v_booking.trip_type, 'one_way')) like '%round%'
-      or lower(coalesce(v_booking.trip_type, 'one_way')) like '%special%' then 'round_trip'
+    when lower(coalesce(v_booking.trip_type, 'one_way')) like '%service%'
+      or lower(coalesce(v_booking.trip_type, 'one_way')) like '%round%'
+      or lower(coalesce(v_booking.trip_type, 'one_way')) like '%special%'
+      or coalesce(v_booking.total_stops, 1) > 1
+      or v_stops_count > 1 then 'round_trip'
     else 'one_way'
   end
     and is_active = true
@@ -2287,14 +2296,23 @@ begin
     into v_fare_config
     from public.fare_configurations
     where is_active = true
-    order by (case when trip_type = 'one_way' then 1 else 2 end)
+    order by (case
+      when lower(coalesce(v_booking.trip_type, 'one_way')) like '%service%'
+        or lower(coalesce(v_booking.trip_type, 'one_way')) like '%round%'
+        or lower(coalesce(v_booking.trip_type, 'one_way')) like '%special%'
+        or coalesce(v_booking.total_stops, 1) > 1
+        or v_stops_count > 1
+      then (case when trip_type = 'round_trip' then 1 else 2 end)
+      else (case when trip_type = 'one_way' then 1 else 2 end)
+    end)
     limit 1;
   end if;
 
   if v_fare_config is null then
-    v_final_fare := coalesce(v_booking.final_fare, v_booking.estimated_fare, 0);
+    v_final_fare := coalesce(v_booking.final_fare, v_booking.actual_fare, v_booking.estimated_fare, 0);
     update public.bookings
     set final_fare = v_final_fare,
+        actual_fare = v_final_fare,
         discount_reviewed_at = now(),
         updated_at = now()
     where id = p_booking_id;
@@ -2541,8 +2559,15 @@ begin
   where booking_id = p_booking_id
     and status = 'PENDING';
 
-  -- Recalculate summary to guarantee math consistency
+  -- Recalculate summary to guarantee math consistency using correct trip type
   v_summary := public.recalculate_booking_discount_summary(p_booking_id);
+
+  v_regular_fare := coalesce(
+    (v_summary->>'regular_fare')::numeric,
+    (v_summary->>'final_fare')::numeric,
+    v_booking.regular_fare,
+    v_booking.estimated_fare
+  );
 
   -- Ensure direct booking columns are fully updated
   update public.bookings
@@ -2550,9 +2575,9 @@ begin
       discount_rejected_reason = p_reason,
       passenger_type_display = 'Regular',
       discount_review_status = 'REJECTED',
-      final_fare = coalesce((v_summary->>'final_fare')::numeric, v_regular_fare),
-      actual_fare = coalesce((v_summary->>'final_fare')::numeric, v_regular_fare),
-      estimated_fare = coalesce((v_summary->>'final_fare')::numeric, v_regular_fare),
+      final_fare = v_regular_fare,
+      actual_fare = v_regular_fare,
+      estimated_fare = v_regular_fare,
       discount_reviewed_at = now(),
       updated_at = now()
   where id = p_booking_id;
@@ -2587,9 +2612,10 @@ begin
     'success', true,
     'booking_id', p_booking_id,
     'fare', v_regular_fare,
-    'regular_fare', v_regular_fare,
     'final_fare', v_regular_fare,
-    'actual_fare', v_regular_fare
+    'regular_fare', v_regular_fare,
+    'discount_review_status', 'REJECTED',
+    'passenger_type_display', 'Regular'
   );
 end;
 $$;
