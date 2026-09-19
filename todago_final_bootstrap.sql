@@ -647,7 +647,23 @@ as $$
 begin
   new.updated_at := now();
 
-  if (
+  -- First, check if expiry dates are in the past
+  if (new.license_expiry_date is not null and new.license_expiry_date < (timezone('Asia/Manila', now()))::date)
+     and (new.franchise_expiry_date is not null and new.franchise_expiry_date < (timezone('Asia/Manila', now()))::date) then
+    new.document_status := 'PENDING';
+    new.document_issue_reason := 'Driver License and Franchise expired';
+  elsif (new.license_expiry_date is not null and new.license_expiry_date < (timezone('Asia/Manila', now()))::date) then
+    new.document_status := 'PENDING';
+    new.document_issue_reason := 'Driver License expired';
+  elsif (new.franchise_expiry_date is not null and new.franchise_expiry_date < (timezone('Asia/Manila', now()))::date) then
+    new.document_status := 'PENDING';
+    new.document_issue_reason := 'Franchise/Prangkisa expired';
+  -- If explicitly set or preserved as VERIFIED by admin, allow it!
+  elsif new.document_status = 'VERIFIED' then
+    new.document_status := 'VERIFIED';
+    new.document_issue_reason := null;
+  -- If all documents and required fields are uploaded, automatically verify
+  elsif (
     coalesce(new.license_front_url, '') <> ''
     and coalesce(new.license_back_url, '') <> ''
     and coalesce(new.license_number, '') not in ('', 'PENDING')
@@ -657,23 +673,18 @@ begin
     and new.franchise_expiry_date is not null
     and coalesce(new.toda_association, '') not in ('', 'Not provided')
   ) then
-    if new.license_expiry_date < (timezone('Asia/Manila', now()))::date
-       and new.franchise_expiry_date < (timezone('Asia/Manila', now()))::date then
-      new.document_status := 'PENDING';
-      new.document_issue_reason := 'Driver License and Franchise expired';
-    elsif new.license_expiry_date < (timezone('Asia/Manila', now()))::date then
-      new.document_status := 'PENDING';
-      new.document_issue_reason := 'Driver License expired';
-    elsif new.franchise_expiry_date < (timezone('Asia/Manila', now()))::date then
-      new.document_status := 'PENDING';
-      new.document_issue_reason := 'Franchise/Prangkisa expired';
-    else
-      new.document_status := 'VERIFIED';
-      new.document_issue_reason := null;
-    end if;
+    new.document_status := 'VERIFIED';
+    new.document_issue_reason := null;
   else
-    new.document_status := 'PENDING';
-    new.document_issue_reason := 'Required documents missing';
+    -- If it was previously VERIFIED and not explicitly reset, maintain VERIFIED
+    if tg_op = 'UPDATE' and old.document_status = 'VERIFIED' then
+      new.document_status := 'VERIFIED';
+    else
+      new.document_status := 'PENDING';
+      if coalesce(new.document_issue_reason, '') = '' then
+        new.document_issue_reason := 'Required documents missing';
+      end if;
+    end if;
   end if;
 
   if new.admin_action_type in ('suspended', 'deleted_requested') then
@@ -3393,5 +3404,123 @@ $$;
 grant execute on function public.create_admin_account(text, text, text, text, text) to authenticated;
 grant execute on function public.delete_admin_account(uuid) to authenticated;
 grant execute on function public.reset_admin_password(uuid, text) to authenticated;
+
+-- Stored Procedure: Admin Set Driver Document Status
+create or replace function public.admin_set_driver_document_status(
+  p_driver_id uuid,
+  p_status text,
+  p_reason text default null
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_norm_status text;
+  v_profile_id uuid;
+  v_updated_driver record;
+begin
+  if auth.uid() is not null and not public.is_admin() then
+    raise exception 'Only administrators can change driver document status.';
+  end if;
+
+  v_norm_status := upper(trim(p_status));
+  if v_norm_status not in ('VERIFIED', 'PENDING', 'EXPIRED', 'REJECTED') then
+    raise exception 'Invalid document status: %', p_status;
+  end if;
+
+  update public.drivers
+  set
+    document_status = v_norm_status,
+    document_issue_reason = case
+      when v_norm_status = 'VERIFIED' then null
+      else coalesce(nullif(trim(p_reason), ''), 'Set to pending by administrator')
+    end,
+    status = case
+      when v_norm_status = 'VERIFIED' then 'approved'
+      else 'pending'
+    end,
+    account_status = case
+      when v_norm_status = 'VERIFIED' then 'ACTIVE'
+      else 'PENDING'
+    end,
+    is_online = case
+      when v_norm_status = 'VERIFIED' then is_online
+      else false
+    end,
+    approved_at = case
+      when v_norm_status = 'VERIFIED' then coalesce(approved_at, now())
+      else approved_at
+    end,
+    approved_by = case
+      when v_norm_status = 'VERIFIED' then coalesce(auth.uid(), approved_by)
+      else approved_by
+    end,
+    updated_at = now()
+  where id = p_driver_id
+  returning id, profile_id, document_status, status, account_status, is_online into v_updated_driver;
+
+  if not found then
+    raise exception 'Driver with ID % not found', p_driver_id;
+  end if;
+
+  if v_updated_driver.profile_id is not null then
+    if v_norm_status = 'VERIFIED' then
+      insert into public.notifications (
+        recipient_id,
+        type,
+        title,
+        body,
+        notification_category,
+        data
+      ) values (
+        v_updated_driver.profile_id,
+        'in_app',
+        'Documents Approved',
+        'Your documents have been approved by the administrator. Your account is now active and you can go online to accept ride requests.',
+        'account_status',
+        jsonb_build_object(
+          'action', 'driver_documents_verified',
+          'document_status', 'VERIFIED',
+          'date', now()
+        )
+      );
+    else
+      insert into public.notifications (
+        recipient_id,
+        type,
+        title,
+        body,
+        notification_category,
+        data
+      ) values (
+        v_updated_driver.profile_id,
+        'in_app',
+        'Document Status Updated',
+        'Your document status is currently pending. Reason: ' || coalesce(nullif(trim(p_reason), ''), 'Under review by administrator'),
+        'account_status',
+        jsonb_build_object(
+          'action', 'driver_documents_pending',
+          'document_status', v_norm_status,
+          'reason', coalesce(nullif(trim(p_reason), ''), 'Under review by administrator'),
+          'date', now()
+        )
+      );
+    end if;
+  end if;
+
+  return jsonb_build_object(
+    'success', true,
+    'driver_id', v_updated_driver.id,
+    'document_status', v_updated_driver.document_status,
+    'status', v_updated_driver.status,
+    'account_status', v_updated_driver.account_status,
+    'is_online', v_updated_driver.is_online
+  );
+end;
+$$;
+
+grant execute on function public.admin_set_driver_document_status(uuid, text, text) to authenticated, service_role, anon;
 
 commit;
